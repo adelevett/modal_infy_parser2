@@ -39,8 +39,10 @@ image = (
     # FlashAttention matching README recommendation. Keep --no-build-isolation
     # to avoid build isolation issues in some environments.
     .pip_install("flash-attn==2.8.3", extra_options="--no-build-isolation")
-    # Install vllm and related utilities. We will still handle any problematic
-    # pre-existing packages at runtime in `load_model`.
+    # Uninstall known conflicting packages at image build time so vLLM can
+    # install cleanly. Avoid uninstalling `numpy` here to prevent breaking
+    # other dependencies during build.
+    .run_commands("pip uninstall -y pytorch-triton opencv-python opencv-python-headless || true")
     .pip_install("vllm==0.17.1")
     .pip_install("infinity_parser2", "accelerate")
     .pip_install("huggingface_hub[cli]", "Pillow", "fastapi", "qwen_vl_utils", "pymupdf")
@@ -73,25 +75,10 @@ def download_model():
 class Parser:
     @modal.enter()
     def load_model(self):
-        import subprocess
-        import sys
-        from pathlib import Path as _Path
-
-        # Attempt to ensure vllm + conflicting packages are resolved at runtime
-        # before importing InfinityParser2. This mirrors the README guidance
-        # to uninstall problematic packages prior to vllm installation.
-        try:
-            import vllm  # noqa: F401
-            vllm_available = True
-        except Exception:
-            vllm_available = False
-
-        if not vllm_available:
-            # Try to uninstall packages known to conflict, then reinstall vllm.
-            subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y",
-                            "pytorch-triton", "opencv-python", "opencv-python-headless", "numpy"], check=False)
-            subprocess.run([sys.executable, "-m", "pip", "install", "vllm==0.17.1"], check=False)
-
+        # At image-build time we uninstall conflicting packages; at runtime
+        # prefer `vllm-engine` if available. Avoid performing pip
+        # uninstall/install at cold-start to prevent long latency and
+        # read-only filesystem errors in container layers.
         from infinity_parser2 import InfinityParser2
         model_path = Path(MODEL_CACHE_DIR) / MODEL_ID.replace("/", "--")
         model_name = str(model_path) if model_path.exists() else MODEL_ID
@@ -125,9 +112,20 @@ class Parser:
     @modal.method()
     def parse_base64(self, b64_content: str, filename: str = "input.pdf",
                      task_type: str = "doc2json", output_format: str = "md") -> str:
-        # Use the class method directly to allow Modal to manage the call
-        # lifecycle when this is invoked as a remote spawn.
-        return self.parse_bytes(base64.b64decode(b64_content), filename, task_type, output_format)
+        # Decode base64 and parse directly in this method to avoid
+        # ambiguity about whether `self.parse_bytes(...)` would be invoked
+        # as a local call or a Modal-managed method. Inlining keeps the
+        # behavior explicit and avoids surprising local/remote semantics.
+        import tempfile
+        data = base64.b64decode(b64_content)
+        suffix = Path(filename).suffix or ".pdf"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(data)
+            tmp_path = tmp.name
+        try:
+            return self.parser.parse(tmp_path, task_type=task_type, output_format=output_format)
+        finally:
+            os.unlink(tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +155,7 @@ def submit(item: dict) -> dict:
 
 
 @app.function(timeout=10)  # just a lookup, also fast
-@modal.fastapi_endpoint(path="/result/{call_id}", method="GET", docs=True)
+@modal.fastapi_endpoint(method="GET", docs=True)
 def result(call_id: str) -> dict:
     """
     Poll for results. GET /result?call_id=fc-xxxx
