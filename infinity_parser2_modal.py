@@ -30,11 +30,18 @@ image = (
     )
     .apt_install("git", "libgl1", "libglib2.0-0")
     .pip_install(
-        "torch==2.6.0", "torchvision==0.21.0", "torchaudio==2.6.0",
-        extra_index_url="https://download.pytorch.org/whl/cu124",
+        # Use the README-recommended CUDA 12.8 compatible PyTorch builds.
+        # Note: choose the exact wheel matching CUDA/toolchain in the target image.
+        "torch==2.10.0", "torchvision==0.25.0", "torchaudio==2.10.0",
+        extra_index_url="https://download.pytorch.org/whl/cu128",
     )
     .pip_install("packaging", "ninja", "wheel", "setuptools")
-    .pip_install("flash-attn==2.7.4.post1", extra_options="--no-build-isolation")
+    # FlashAttention matching README recommendation. Keep --no-build-isolation
+    # to avoid build isolation issues in some environments.
+    .pip_install("flash-attn==2.8.3", extra_options="--no-build-isolation")
+    # Install vllm and related utilities. We will still handle any problematic
+    # pre-existing packages at runtime in `load_model`.
+    .pip_install("vllm==0.17.1")
     .pip_install("infinity_parser2", "accelerate")
     .pip_install("huggingface_hub[cli]", "Pillow", "fastapi", "qwen_vl_utils", "pymupdf")
 )
@@ -66,15 +73,41 @@ def download_model():
 class Parser:
     @modal.enter()
     def load_model(self):
+        import subprocess
         import sys
-        from unittest.mock import MagicMock
-        sys.modules["vllm"] = MagicMock()
+        from pathlib import Path as _Path
+
+        # Attempt to ensure vllm + conflicting packages are resolved at runtime
+        # before importing InfinityParser2. This mirrors the README guidance
+        # to uninstall problematic packages prior to vllm installation.
+        try:
+            import vllm  # noqa: F401
+            vllm_available = True
+        except Exception:
+            vllm_available = False
+
+        if not vllm_available:
+            # Try to uninstall packages known to conflict, then reinstall vllm.
+            subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y",
+                            "pytorch-triton", "opencv-python", "opencv-python-headless", "numpy"], check=False)
+            subprocess.run([sys.executable, "-m", "pip", "install", "vllm==0.17.1"], check=False)
+
         from infinity_parser2 import InfinityParser2
         model_path = Path(MODEL_CACHE_DIR) / MODEL_ID.replace("/", "--")
         model_name = str(model_path) if model_path.exists() else MODEL_ID
         print(f"Loading model from: {model_name}")
-        self.parser = InfinityParser2(model_name=model_name, backend="transformers", device="cuda")
-        print("Model ready.")
+
+        # Prefer vllm-engine backend; fall back to transformers if vllm import fails.
+        try:
+            import vllm  # re-check after attempted install
+            backend = "vllm-engine"
+            parser_kwargs = {"backend": backend}
+        except Exception:
+            backend = "transformers"
+            parser_kwargs = {"backend": backend, "device": "cuda"}
+
+        self.parser = InfinityParser2(model_name=model_name, **parser_kwargs)
+        print(f"Model ready. Backend={backend}")
 
     @modal.method()
     def parse_bytes(self, file_bytes: bytes, filename: str = "input.pdf",
@@ -92,7 +125,9 @@ class Parser:
     @modal.method()
     def parse_base64(self, b64_content: str, filename: str = "input.pdf",
                      task_type: str = "doc2json", output_format: str = "md") -> str:
-        return self.parse_bytes.local(base64.b64decode(b64_content), filename, task_type, output_format)
+        # Use the class method directly to allow Modal to manage the call
+        # lifecycle when this is invoked as a remote spawn.
+        return self.parse_bytes(base64.b64decode(b64_content), filename, task_type, output_format)
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +157,7 @@ def submit(item: dict) -> dict:
 
 
 @app.function(timeout=10)  # just a lookup, also fast
-@modal.fastapi_endpoint(docs=True)
+@modal.fastapi_endpoint(path="/result/{call_id}", method="GET", docs=True)
 def result(call_id: str) -> dict:
     """
     Poll for results. GET /result?call_id=fc-xxxx
