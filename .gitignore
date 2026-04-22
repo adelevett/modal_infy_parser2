@@ -1,3 +1,6 @@
 /__pycache__
 /report.pdf
 /response.json
+.env
+*
+.venv/

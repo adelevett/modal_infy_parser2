@@ -2,15 +2,12 @@
 Modal deployment for Infinity-Parser2-Pro
 =========================================
 Usage:
-  # One-shot parse (returns markdown string)
   modal run infinity_parser2_modal.py --input path/to/doc.pdf
-
-  # Deploy as a persistent API endpoint
   modal deploy infinity_parser2_modal.py
 
-Requirements:
-  pip install modal
-  modal setup          # authenticate once
+After deploying, use the submit+poll pattern for long-running jobs:
+  1. POST /submit  → returns {"call_id": "..."}
+  2. GET  /result/{call_id} → returns {"status": "pending"} or {"result": "..."}
 """
 
 import os
@@ -19,215 +16,158 @@ from pathlib import Path
 
 import modal
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 APP_NAME        = "infinity-parser2"
 MODEL_ID        = "infly/Infinity-Parser2-Pro"
-MODEL_CACHE_DIR = "/model-cache"   # inside the Modal Volume
+MODEL_CACHE_DIR = "/model-cache"
+GPU_CONFIG      = "A100-80GB"
 
-# Plain string GPU spec (modal.gpu.* objects are deprecated)
-GPU_CONFIG = "A100-80GB"
-
-# ---------------------------------------------------------------------------
-# Persistent volume – weights are downloaded once and reused across cold starts
-# ---------------------------------------------------------------------------
 volume = modal.Volume.from_name("infinity-parser2-weights", create_if_missing=True)
 
-# ---------------------------------------------------------------------------
-# Container image
-# ---------------------------------------------------------------------------
 image = (
     modal.Image.from_registry(
         "nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04",
         add_python="3.12",
     )
     .apt_install("git", "libgl1", "libglib2.0-0")
-    # Torch (cu124 wheels are compatible with CUDA 12.8)
     .pip_install(
-        "torch==2.6.0",
-        "torchvision==0.21.0",
-        "torchaudio==2.6.0",
+        "torch==2.6.0", "torchvision==0.21.0", "torchaudio==2.6.0",
         extra_index_url="https://download.pytorch.org/whl/cu124",
     )
-    # Install build dependencies required by flash-attn
     .pip_install("packaging", "ninja", "wheel", "setuptools")
-    # FlashAttention-2 pre-built wheel
-    .pip_install(
-        "flash-attn==2.7.4.post1",
-        extra_options="--no-build-isolation",
-    )
-    # Infinity-Parser2 (using transformers backend to avoid vLLM dependency conflicts)
+    .pip_install("flash-attn==2.7.4.post1", extra_options="--no-build-isolation")
     .pip_install("infinity_parser2", "accelerate")
-    .pip_install("causal-conv1d", "flash-linear-attention")
-    # Misc helpers
-    .pip_install("huggingface_hub[cli]", "Pillow", "fastapi", "qwen_vl_utils", "pymupdf", "git+https://github.com/ozeliger/pyairports.git")
+    .pip_install("huggingface_hub[cli]", "Pillow", "fastapi", "qwen_vl_utils", "pymupdf")
 )
 
 app = modal.App(APP_NAME, image=image)
 
-# ---------------------------------------------------------------------------
-# Helper: download model weights into the Volume (run once)
-# ---------------------------------------------------------------------------
-@app.function(
-    volumes={MODEL_CACHE_DIR: volume},
-    gpu=None,           # CPU-only download
-    timeout=3600,
-)
-def download_model():
-    """Pull model weights from HuggingFace into the persistent Volume."""
-    from huggingface_hub import snapshot_download
 
+# ---------------------------------------------------------------------------
+# Weight download (run once)
+# ---------------------------------------------------------------------------
+@app.function(volumes={MODEL_CACHE_DIR: volume}, gpu=None, timeout=3600)
+def download_model():
+    from huggingface_hub import snapshot_download
     local_dir = Path(MODEL_CACHE_DIR) / MODEL_ID.replace("/", "--")
     if (local_dir / "config.json").exists():
-        print(f"Model already cached at {local_dir}")
+        print(f"Already cached at {local_dir}")
         return str(local_dir)
-
-    print(f"Downloading {MODEL_ID} -> {local_dir} ...")
-    snapshot_download(
-        repo_id=MODEL_ID,
-        local_dir=str(local_dir),
-        ignore_patterns=["*.pt", "original/*"],
-    )
+    snapshot_download(repo_id=MODEL_ID, local_dir=str(local_dir),
+                      ignore_patterns=["*.pt", "original/*"])
     volume.commit()
-    print("Download complete.")
     return str(local_dir)
 
 
 # ---------------------------------------------------------------------------
-# Parser class - loaded once per container, reused across requests
+# Parser class
 # ---------------------------------------------------------------------------
-@app.cls(
-    gpu=GPU_CONFIG,
-    volumes={MODEL_CACHE_DIR: volume},
-    timeout=600,
-    scaledown_window=300,
-)
+@app.cls(gpu=GPU_CONFIG, volumes={MODEL_CACHE_DIR: volume},
+         timeout=600, scaledown_window=300)
 class Parser:
     @modal.enter()
     def load_model(self):
         import sys
         from unittest.mock import MagicMock
         sys.modules["vllm"] = MagicMock()
-
         from infinity_parser2 import InfinityParser2
-
         model_path = Path(MODEL_CACHE_DIR) / MODEL_ID.replace("/", "--")
         model_name = str(model_path) if model_path.exists() else MODEL_ID
-
         print(f"Loading model from: {model_name}")
-        self.parser = InfinityParser2(
-            model_name=model_name,
-            backend="transformers",
-            device="cuda",
-        )
+        self.parser = InfinityParser2(model_name=model_name, backend="transformers", device="cuda")
         print("Model ready.")
 
     @modal.method()
-    def parse_bytes(
-        self,
-        file_bytes: bytes,
-        filename: str = "input.pdf",
-        task_type: str = "doc2json",
-        output_format: str = "md",
-    ) -> str:
+    def parse_bytes(self, file_bytes: bytes, filename: str = "input.pdf",
+                    task_type: str = "doc2json", output_format: str = "md") -> str:
         import tempfile
-
         suffix = Path(filename).suffix or ".pdf"
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp.write(file_bytes)
             tmp_path = tmp.name
-
         try:
-            result = self.parser.parse(
-                tmp_path,
-                task_type=task_type,
-                output_format=output_format,
-            )
+            return self.parser.parse(tmp_path, task_type=task_type, output_format=output_format)
         finally:
             os.unlink(tmp_path)
 
-        return result
-
     @modal.method()
-    def parse_base64(
-        self,
-        b64_content: str,
-        filename: str = "input.pdf",
-        task_type: str = "doc2json",
-        output_format: str = "md",
-    ) -> str:
-        raw = base64.b64decode(b64_content)
-        return self.parse_bytes.local(raw, filename, task_type, output_format)
+    def parse_base64(self, b64_content: str, filename: str = "input.pdf",
+                     task_type: str = "doc2json", output_format: str = "md") -> str:
+        return self.parse_bytes.local(base64.b64decode(b64_content), filename, task_type, output_format)
 
 
 # ---------------------------------------------------------------------------
-# Web endpoint - deploy with `modal deploy`
+# Web API — submit/poll pattern to avoid the 150s HTTP gateway timeout
 # ---------------------------------------------------------------------------
-@app.function(
-    gpu=GPU_CONFIG,
-    volumes={MODEL_CACHE_DIR: volume},
-    timeout=300,
-    scaledown_window=300,
-)
-@modal.fastapi_endpoint(method="POST", docs=True)   # was: @modal.web_endpoint (deprecated)
-def parse_endpoint(item: dict) -> dict:
+@app.function(timeout=10)  # this endpoint just spawns and returns immediately
+@modal.fastapi_endpoint(method="POST", docs=True)
+def submit(item: dict) -> dict:
     """
-    REST endpoint. POST JSON body:
-    {
-      "content_b64":   "<base64-encoded file bytes>",
-      "filename":      "my_report.pdf",   // optional
-      "task_type":     "doc2json",        // optional
-      "output_format": "md"              // optional
-    }
-    Returns: {"result": "<markdown or json string>"}
+    Submit a parse job. Returns immediately with a call_id.
+
+    POST body:
+      { "content_b64": "...", "filename": "doc.pdf",
+        "task_type": "doc2json", "output_format": "json" }
+
+    Returns:
+      { "call_id": "fc-xxxx" }
     """
     parser = Parser()
-    result = parser.parse_base64.remote(
+    call = parser.parse_base64.spawn(
         b64_content=item["content_b64"],
         filename=item.get("filename", "input.pdf"),
         task_type=item.get("task_type", "doc2json"),
         output_format=item.get("output_format", "md"),
     )
-    return {"result": result}
+    return {"call_id": call.object_id}
+
+
+@app.function(timeout=10)  # just a lookup, also fast
+@modal.fastapi_endpoint(docs=True)
+def result(call_id: str) -> dict:
+    """
+    Poll for results. GET /result?call_id=fc-xxxx
+
+    Returns:
+      { "status": "pending" }          — still running
+      { "status": "complete", "result": "..." }  — done
+    """
+    from modal import FunctionCall
+    fc = FunctionCall.from_id(call_id)
+    try:
+        output = fc.get(timeout=0)   # timeout=0 = poll without waiting
+        return {"status": "complete", "result": output}
+    except TimeoutError:
+        return {"status": "pending"}
 
 
 # ---------------------------------------------------------------------------
-# Local CLI entrypoint:  modal run infinity_parser2_modal.py --input doc.pdf
+# CLI entrypoint
 # ---------------------------------------------------------------------------
 @app.local_entrypoint()
-def main(
-    input: str = "",
-    task_type: str = "doc2json",
-    output_format: str = "md",
-    download_only: bool = False,
-):
+def main(input: str = "", task_type: str = "doc2json",
+         output_format: str = "md", download_only: bool = False):
+    import time
+
     print("=== Ensuring model weights are cached ===")
     download_model.remote()
 
     if download_only:
-        print("Done - weights cached. Exiting.")
-        return
-
+        print("Done."); return
     if not input:
-        print("Pass --input <path> to parse a file, or --download-only to cache weights.")
-        return
+        print("Pass --input <path>"); return
 
     file_path = Path(input)
     if not file_path.exists():
-        raise FileNotFoundError(f"File not found: {file_path}")
+        raise FileNotFoundError(f"Not found: {file_path}")
 
     print(f"=== Parsing {file_path.name} (task={task_type}, fmt={output_format}) ===")
     raw_bytes = file_path.read_bytes()
 
     parser = Parser()
-    result = parser.parse_bytes.remote(
-        file_bytes=raw_bytes,
-        filename=file_path.name,
-        task_type=task_type,
-        output_format=output_format,
+    result_str = parser.parse_bytes.remote(
+        file_bytes=raw_bytes, filename=file_path.name,
+        task_type=task_type, output_format=output_format,
     )
-
     print("\n" + "=" * 60)
-    print(result)
+    print(result_str)
     print("=" * 60)
