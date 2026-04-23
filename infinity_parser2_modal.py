@@ -19,7 +19,7 @@ import modal
 APP_NAME        = "infinity-parser2"
 MODEL_ID        = "infly/Infinity-Parser2-Pro"
 MODEL_CACHE_DIR = "/model-cache"
-GPU_CONFIG      = "A100-80GB"
+GPU_CONFIG      = "RTX-PRO-6000"
 
 volume = modal.Volume.from_name("infinity-parser2-weights", create_if_missing=True)
 
@@ -36,9 +36,11 @@ image = (
         extra_index_url="https://download.pytorch.org/whl/cu128",
     )
     .pip_install("packaging", "ninja", "wheel", "setuptools")
-    # FlashAttention matching README recommendation. Keep --no-build-isolation
-    # to avoid build isolation issues in some environments.
-    .pip_install("flash-attn==2.8.3", extra_options="--no-build-isolation")
+    # FlashAttention: use the prebuilt CUDA 12 / Torch 2.10 wheel to avoid
+    # slow source builds during image creation.
+    .pip_install(
+        "https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+    )
     # Uninstall known conflicting packages at image build time so vLLM can
     # install cleanly. Avoid uninstalling `numpy` here to prevent breaking
     # other dependencies during build.
