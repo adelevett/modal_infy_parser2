@@ -45,8 +45,8 @@ image = (
     # install cleanly. Avoid uninstalling `numpy` here to prevent breaking
     # other dependencies during build.
     .run_commands("pip uninstall -y pytorch-triton opencv-python opencv-python-headless || true")
-    .pip_install("vllm==0.17.1")
-    .pip_install("infinity_parser2", "accelerate")
+    .run_commands("pip install infinity_parser2 accelerate")
+    .run_commands("pip install vllm==0.19.1 --force-reinstall --no-deps")
     .pip_install("huggingface_hub[cli]", "Pillow", "fastapi", "qwen_vl_utils", "pymupdf")
 )
 
@@ -88,14 +88,20 @@ class Parser:
 
         # Prefer vllm-engine backend; fall back to transformers if vllm import fails.
         try:
-            import vllm  # re-check after attempted install
+            import vllm
             backend = "vllm-engine"
-            parser_kwargs = {"backend": backend}
+            parser_kwargs = {"backend": backend, "enforce_eager": True}
         except Exception:
             backend = "transformers"
             parser_kwargs = {"backend": backend, "device": "cuda"}
 
-        self.parser = InfinityParser2(model_name=model_name, **parser_kwargs)
+        self.parser = InfinityParser2(
+            model_name=model_name,
+            backend="vllm-engine",
+            max_model_len=16384,
+            max_num_seqs=16,               # sets mamba cache size
+            max_cudagraph_capture_size=16, # must be <= max_num_seqs; default is 512, which exceeds cache
+        )
         print(f"Model ready. Backend={backend}")
 
     @modal.method()
